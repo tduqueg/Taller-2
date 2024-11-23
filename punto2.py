@@ -1,24 +1,41 @@
 import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
+from sklearn.dummy import DummyClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
 from tqdm import tqdm
 
 # Configuración del dispositivo
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Dataset personalizado
+def remove_redundant_features(X, correlation_threshold=0.95):
+    """Elimina características altamente correlacionadas."""
+    corr_matrix = X.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > correlation_threshold)]
+    return X.drop(columns=to_drop), to_drop
+
+def select_features(X, y, n_features=10):
+    """Selecciona las características más importantes usando ANOVA F-value."""
+    selector = SelectKBest(f_classif, k=n_features)
+    selector.fit(X, y)
+    feature_mask = selector.get_support()
+    selected_features = X.columns[feature_mask].tolist()
+    X_selected = pd.DataFrame(selector.transform(X), columns=selected_features)
+    return X_selected, selected_features
+
 class CreditCardDataset(Dataset):
     def __init__(self, X, y, is_multiclass=False):
-        self.X = torch.FloatTensor(X).to(device)
-        # Usar LongTensor para multiclass, FloatTensor para binario
-        self.y = torch.LongTensor(y).to(device) if is_multiclass else torch.FloatTensor(y).to(device)
+        self.X = torch.FloatTensor(X.values if isinstance(X, pd.DataFrame) else X).to(device)
+        self.y = (torch.LongTensor(y.values if isinstance(y, pd.Series) else y) if is_multiclass 
+                 else torch.FloatTensor(y.values if isinstance(y, pd.Series) else y)).to(device)
         
     def __len__(self):
         return len(self.X)
@@ -26,7 +43,7 @@ class CreditCardDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# Modelo de Regresión Lineal para Clasificación
+# Modelos
 class LinearClassification(nn.Module):
     def __init__(self, input_dim):
         super(LinearClassification, self).__init__()
@@ -35,7 +52,6 @@ class LinearClassification(nn.Module):
     def forward(self, x):
         return torch.sigmoid(self.linear(x))
 
-# Modelo de Regresión Logística
 class LogisticRegression(nn.Module):
     def __init__(self, input_dim):
         super(LogisticRegression, self).__init__()
@@ -44,16 +60,14 @@ class LogisticRegression(nn.Module):
     def forward(self, x):
         return torch.sigmoid(self.linear(x))
 
-# Modelo de Regresión Logística Multiclase
 class MulticlassLogisticRegression(nn.Module):
     def __init__(self, input_dim, num_classes):
         super(MulticlassLogisticRegression, self).__init__()
         self.linear = nn.Linear(input_dim, num_classes)
         
     def forward(self, x):
-        return self.linear(x)  # No aplicamos softmax aquí ya que CrossEntropyLoss lo incluye
+        return self.linear(x)
 
-# Modelo de LDA
 class LDAModel(nn.Module):
     def __init__(self, input_dim, num_classes):
         super(LDAModel, self).__init__()
@@ -62,11 +76,23 @@ class LDAModel(nn.Module):
         
     def forward(self, x):
         x = self.batch_norm(x)
-        return self.linear(x)  # No aplicamos softmax aquí ya que CrossEntropyLoss lo incluye
+        return self.linear(x)
+
+def get_baseline_metrics(X_train, X_test, y_train, y_test):
+    """Calcula métricas para un modelo baseline (clasificador aleatorio)."""
+    dummy = DummyClassifier(strategy='stratified')
+    dummy.fit(X_train, y_train)
+    y_pred = dummy.predict_proba(X_test)[:, 1]
+    return {
+        'roc_auc': roc_auc_score(y_test, y_pred),
+        'pr_auc': average_precision_score(y_test, y_pred),
+        'classification_report': classification_report(y_test, (y_pred > 0.5).astype(int))
+    }
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10, model_name=""):
     best_val_loss = float('inf')
     best_metrics = None
+    model = model.to(device)
     
     for epoch in range(epochs):
         model.train()
@@ -76,7 +102,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10
             optimizer.zero_grad()
             outputs = model(batch_X)
             
-            # Manejar diferentes tipos de salidas según el criterio
             if isinstance(criterion, nn.CrossEntropyLoss):
                 loss = criterion(outputs, batch_y)
                 predictions = torch.softmax(outputs, dim=1)[:, 1]
@@ -132,24 +157,44 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10
     return best_metrics
 
 def main():
-    # Cargar y preparar datos
+    # 1. Cargar datos
+    print("Cargando datos...")
     df = pd.read_csv('card_transdata.csv')
-    X = df.drop('fraud', axis=1).values
-    y = df['fraud'].values
+    X = df.drop('fraud', axis=1)
+    y = df['fraud']
     
-    # Escalado de características
+    # 2. Eliminar información redundante
+    print("Eliminando features redundantes...")
+    X_cleaned, dropped_features = remove_redundant_features(X)
+    print(f"Features eliminadas por correlación: {dropped_features}")
+    
+    # 3. Selección de variables
+    print("Seleccionando features importantes...")
+    X_selected, selected_features = select_features(X_cleaned, y)
+    print(f"Features seleccionadas: {selected_features}")
+    
+    # 4. Escalado de características
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X_selected)
+    X_scaled = pd.DataFrame(X_scaled, columns=X_selected.columns)
     
-    # Split de datos
+    # 5. Split inicial para test final
+    print("Separando datos en train y test...")
     X_train, X_test, y_train, y_test = train_test_split(
         X_scaled, y, test_size=0.2, random_state=42, stratify=y
     )
     
-    # Crear datasets y dataloaders
+    # 6. Obtener métricas baseline
+    print("Calculando métricas baseline...")
+    baseline_metrics = get_baseline_metrics(X_train, X_test, y_train, y_test)
+    print("\nMétricas Baseline:")
+    print(f"ROC AUC Baseline: {baseline_metrics['roc_auc']:.4f}")
+    print(f"PR AUC Baseline: {baseline_metrics['pr_auc']:.4f}")
+    
+    # 7. Crear datasets y dataloaders
     batch_size = 1024
     
-    # Configurar modelos y sus respectivos datasets
+    # 8. Configurar y entrenar modelos
     models = {
         'Linear Classification': {
             'model': LinearClassification(X_train.shape[1]),
@@ -206,6 +251,17 @@ def main():
         print(results[name]['classification_report'])
         print(f"ROC AUC: {results[name]['roc_auc']:.4f}")
         print(f"PR AUC: {results[name]['pr_auc']:.4f}")
+    
+    # 9. Comparar todos los modelos
+    print("\nComparación final de modelos:")
+    print("-----------------------------")
+    print("\nMétricas Baseline:")
+    print(f"ROC AUC Baseline: {baseline_metrics['roc_auc']:.4f}")
+    print(f"PR AUC Baseline: {baseline_metrics['pr_auc']:.4f}")
+    for name, metrics in results.items():
+        print(f"\n{name}:")
+        print(f"ROC AUC: {metrics['roc_auc']:.4f}")
+        print(f"PR AUC: {metrics['pr_auc']:.4f}")
 
 if __name__ == "__main__":
     main()
